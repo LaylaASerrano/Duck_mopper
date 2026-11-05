@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ESP32 WiFi and broker credentials
+firmware/*/src/secrets.h
