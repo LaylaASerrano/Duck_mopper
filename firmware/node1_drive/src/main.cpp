@@ -1,8 +1,17 @@
 #include <Arduino.h>
+#include <atomic>
 #include <ESP32Servo.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// WiFi and broker settings. Copy secrets.example.h to secrets.h to enable MQTT;
+// without it the robot still runs from the button.
+#if __has_include("secrets.h")
+#include "secrets.h"
+#define HAVE_SECRETS 1
+#endif
+
 // ESP32 #1: ultrasonic sensor, wheel and scrubber motors, emergency stop, MQTT.
-
-
 
 // ----------- Constants and structers ----------
 // servo
@@ -24,6 +33,11 @@ const int PWM_RES  = 8;       // 8-bit: duty 0..255
 const int TRIG_PIN = 22, ECHO_PIN = 23; // ECHO needs the 5V -> 3.3V divider
 const float DETECT_CM = 50.0;
 
+// emergency stop: momentary button from this pin to GND
+const int ESTOP_PIN = 27;
+const unsigned long RESUME_HOLD = 2000;   // hold this long to start from STOPPED
+const unsigned long RELEASE_TIME = 50;    // must read released this long (debounce)
+
 // timing
 const unsigned long SENS_INT = 60;
 const unsigned long PAUSE_TIME = 100;
@@ -34,7 +48,7 @@ enum State {
     DRIVING, PAUSE_BEFORE_BACKUP, BACKUP, TURNING, PAUSE_AFTER_TURN, STOPPED
 };
 
-State state = DRIVING;
+State state = STOPPED;   // never moves on power-up: needs the button or an MQTT start
 unsigned long stateStart = 0;
 unsigned long turnTime = 0;
 unsigned long lastSensorRead = 0;
@@ -170,30 +184,211 @@ void setupSensor(){
     digitalWrite(TRIG_PIN, LOW);
 }
 
-// CHANGED: removed old blocking randomTurn(). It was never called; the
-// millis() state machine (updateRobot) replaces it after testing.
+// ---------------- state machine ----------------
+const char* stateName(State s){
+    switch (s){
+        case DRIVING: return "DRIVING";
+        case PAUSE_BEFORE_BACKUP: return "PAUSE_BEFORE_BACKUP";
+        case BACKUP: return "BACKUP";
+        case TURNING: return "TURNING";
+        case PAUSE_AFTER_TURN: return "PAUSE_AFTER_TURN";
+        case STOPPED: return "STOPPED";
+    }
+
+    return "UNKNOWN";
+}
+
+void enterState(State next){
+    state = next;
+    stateStart = millis();
+    Serial.printf("state: %s\n", stateName(next));
+}
+
+void startRobot(){
+    if (state != STOPPED) return;
+    startSweep(broom);
+    startSweep(sponge);
+    forward();
+    enterState(DRIVING);
+}
+
+// Latches: nothing moves again until startRobot().
+void stopRobot(){
+    stopBot();
+    stopSweep(broom);
+    stopSweep(sponge);
+    if (state != STOPPED) enterState(STOPPED);
+}
+
+void updateRobot(){
+    unsigned long elapsed = millis() - stateStart;
+    switch (state){
+        case DRIVING:
+            if (obstacleDetected()){
+                Serial.printf("Obstacle at %.1f cm\n", lastDist);
+                stopBot();
+                enterState(PAUSE_BEFORE_BACKUP);
+            }
+            break;
+        case PAUSE_BEFORE_BACKUP:
+            if (elapsed >= PAUSE_TIME){
+                backward();
+                enterState(BACKUP);
+            }
+            break;
+        case BACKUP:
+            if (elapsed >= BACKUP_TIME){
+                turnTime = random(300, 900);
+                if (random(2)) spinLeft(); else spinRight();
+                enterState(TURNING);
+            }
+            break;
+        case TURNING:
+            if (elapsed >= turnTime){
+                stopBot();
+                enterState(PAUSE_AFTER_TURN);
+            }
+            break;
+        case PAUSE_AFTER_TURN:
+            if (elapsed >= PAUSE_TIME){
+                forward();
+                enterState(DRIVING);
+            }
+            break;
+        case STOPPED:
+            break;
+    }
+}
+
+// ---------------- emergency stop ----------------
+// A press stops at once. From STOPPED, a 2 s hold starts the robot. The button
+// must be seen released between actions, so a stuck button can't restart it.
+bool btnWasUp = false;
+unsigned long btnDownAt = 0;
+unsigned long btnUpAt = 0;
+
+void updateEStop(){
+    if (digitalRead(ESTOP_PIN) == HIGH){
+        if (btnUpAt == 0) btnUpAt = millis();
+        if (millis() - btnUpAt >= RELEASE_TIME) btnWasUp = true;
+        btnDownAt = 0;
+        return;
+    }
+    btnUpAt = 0;
+    if (!btnWasUp) return;
+
+    if (state != STOPPED){
+        Serial.println("E-stop: button");
+        stopRobot();
+        btnWasUp = false;
+        return;
+    }
+    if (btnDownAt == 0) btnDownAt = millis();
+    if (millis() - btnDownAt >= RESUME_HOLD){
+        btnWasUp = false;
+        startRobot();
+    }
+}
+
+void setupEStop(){
+    pinMode(ESTOP_PIN, INPUT_PULLUP);
+}
+
+// ---------------- WiFi and MQTT ----------------
+// See docs/mqtt_topics.md. Connecting can block for seconds, so this runs in its
+// own task on core 0 and loop() keeps driving and watching the e-stop on core 1.
+enum Command { CMD_NONE, CMD_START, CMD_STOP };
+std::atomic<Command> pendingCmd{CMD_NONE};   // set by the network task, used in loop()
+
+void handleCommand(){
+    Command cmd = pendingCmd.exchange(CMD_NONE);
+    if (cmd == CMD_START) startRobot();
+    if (cmd == CMD_STOP){
+        Serial.println("E-stop: MQTT");
+        stopRobot();
+    }
+}
+
+#ifdef HAVE_SECRETS
+const char* TOPIC_CMD       = "duckmopper/node1/cmd";
+const char* TOPIC_STATUS    = "duckmopper/node1/status";
+const char* TOPIC_TELEMETRY = "duckmopper/node1/telemetry";
+const unsigned long TELEMETRY_INT = 500;
+const unsigned long RECONNECT_INT = 5000;
+
+WiFiClient netClient;
+PubSubClient mqtt(netClient);
+
+void onMqttMessage(char* topic, byte* payload, unsigned int len){
+    String msg;
+    for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
+    if (msg == "start") pendingCmd = CMD_START;
+    else if (msg == "stop" || msg == "estop") pendingCmd = CMD_STOP;
+}
+
+void networkTask(void*){
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    mqtt.setServer(MQTT_HOST, MQTT_PORT);
+    mqtt.setCallback(onMqttMessage);
+
+    unsigned long lastTry = 0, lastSend = 0;
+    bool tried = false;
+    for (;;){
+        if (WiFi.status() == WL_CONNECTED && !mqtt.connected()
+                && (!tried || millis() - lastTry >= RECONNECT_INT)){
+            tried = true;
+            lastTry = millis();
+            if (mqtt.connect("duckmopper-node1", TOPIC_STATUS, 1, true, "offline")){
+                mqtt.publish(TOPIC_STATUS, "online", true);
+                mqtt.subscribe(TOPIC_CMD, 1);
+                Serial.println("MQTT connected");
+            }
+        }
+        if (mqtt.connected()){
+            mqtt.loop();
+            if (millis() - lastSend >= TELEMETRY_INT){
+                lastSend = millis();
+                char buf[80];
+                snprintf(buf, sizeof(buf), "{\"dist_cm\":%.1f,\"state\":\"%s\"}",
+                         lastDist, stateName(state));
+                mqtt.publish(TOPIC_TELEMETRY, buf);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+#endif
+
+void startNetwork(){
+#ifdef HAVE_SECRETS
+    xTaskCreatePinnedToCore(networkTask, "network", 8192, nullptr, 1, nullptr, 0);
+#else
+    Serial.println("No secrets.h: MQTT off, use the button.");
+#endif
+}
 
 // ----- setup function for all hardware -----
 void setup(){
     Serial.begin(115200);
-    randomSeed(esp_random());   // CHANGED: real random turns later
+    randomSeed(esp_random());
     setupSensor();
+    setupEStop();
     setupServos();
     setupMotors();
 
+#ifdef HARDWARE_TEST
     Serial.println("Setup done. Wheels will spin in 3 s, lift the robot off the ground.");
     delay(3000);
+#else
+    startNetwork();
+    Serial.println("Setup done. Hold the button 2 s or send MQTT start.");
+#endif
 }
 
 
-// state machine 
-
-
-
-
-
-
-
+#ifdef HARDWARE_TEST
 // --------- hardware test: runs each part in turn and prints what should be happening
 void testSensor(unsigned long ms){
     Serial.println("-- sensor (-1 = no echo)");
@@ -240,7 +435,7 @@ void testScrubbers(unsigned long ms){
     stopSweep(sponge);
 }
 
-// -------- main loop ----------
+// -------- main loop (hardware test build) ----------
 void loop(){
     testSensor(3000);
 
@@ -258,3 +453,14 @@ void loop(){
     Serial.println("== cycle done ==");
     delay(2000);
 }
+
+#else
+// -------- main loop ----------
+void loop(){
+    updateEStop();
+    handleCommand();
+    updateSensor();
+    updateRobot();
+    updateScrubbers();
+}
+#endif
