@@ -18,13 +18,23 @@
 Servo broom_serv, sponge1_serv, sponge2_serv;
 const int BROOM_PIN = 19, SPONGE_1_PIN = 21, SPONGE_2_PIN = 18; // servos
 
-// motors
-const int AIN1 = 25, AIN2 = 26;   // left side NOTE: (12 breaks boot, 14 twitches at boot)
-const int BIN1 = 32, BIN2 = 33;   // right side
+// motors: two drivers, front and back. If a wheel spins backwards, swap its two pins.
+// NOTE: 12 breaks boot, 14 twitches at boot, 34-39 are input-only (no PWM)
+struct Motor {
+    const char* name;
+    int in1, in2;
+};
 
-// LEDC channels for the motors, kept away from the servos' channels so they
-// never share a timer (channels share timers in pairs: 0/1, 2/3, ...)
-const int MOTOR_CH[4] = {8, 9, 10, 11};
+Motor frontLeft  = {"front left",  25, 26};   // front driver, motor A
+Motor frontRight = {"front right", 32, 33};   // front driver, motor B
+Motor backLeft   = {"back left",   16, 17};   // back driver, motor B
+Motor backRight  = {"back right",   4, 13};   // back driver, motor A (34/35 can't output)
+Motor* motors[4] = {&frontLeft, &frontRight, &backLeft, &backRight};
+
+// LEDC channels for the motor pins, two per motor in the order above. ESP32Servo
+// gives the three servos channels 0, 1 and 8, and the core silently shares a channel
+// that is already in use, so the motors must stay off those three.
+const int MOTOR_CH[8] = {2, 3, 4, 5, 6, 7, 10, 11};
 
 const int PWM_FREQ = 20000;   // 20 kHz: above hearing, no motor whine
 const int PWM_RES  = 8;       // 8-bit: duty 0..255
@@ -57,22 +67,22 @@ float lastDist = -1;
 
 // ---------------  motor control ------------
 
-void setMotor(int pinA, int pinB, int speed){ // -255-255
+void setMotor(Motor& m, int speed){ // -255-255
     speed = constrain(speed, -255, 255);
     if (speed > 0) {
-        ledcWrite(pinA, speed);
-        ledcWrite(pinB, 0);
+        ledcWrite(m.in1, speed);
+        ledcWrite(m.in2, 0);
     }else if (speed < 0) {
-        ledcWrite(pinA, 0);
-        ledcWrite(pinB, -speed);
+        ledcWrite(m.in1, 0);
+        ledcWrite(m.in2, -speed);
     } else {
-        ledcWrite(pinA, 0);
-        ledcWrite(pinB, 0);
+        ledcWrite(m.in1, 0);
+        ledcWrite(m.in2, 0);
     }
 }
 
-void setLeft(int speed) { setMotor(AIN1, AIN2, speed);}
-void setRight(int speed){ setMotor(BIN1, BIN2, speed);}
+void setLeft(int speed) { setMotor(frontLeft, speed);  setMotor(backLeft, speed);}
+void setRight(int speed){ setMotor(frontRight, speed); setMotor(backRight, speed);}
 void drive(int l, int r){ setLeft(l); setRight(r);}
 
 void forward() { drive(180, 180);}
@@ -82,10 +92,12 @@ void spinRight() {drive(180, -180);}
 void stopBot() {drive(0, 0);}
 
 void setupMotors() {
-    int pins[4] = {AIN1, AIN2, BIN1, BIN2};
     for (int i = 0; i < 4; i++){
-        if (!ledcAttachChannel(pins[i], PWM_FREQ, PWM_RES, MOTOR_CH[i])){
-            Serial.printf("LEDC attach failed on pin %d\n", pins[i]);
+        int pins[2] = {motors[i]->in1, motors[i]->in2};
+        for (int j = 0; j < 2; j++){
+            if (!ledcAttachChannel(pins[j], PWM_FREQ, PWM_RES, MOTOR_CH[2 * i + j])){
+                Serial.printf("LEDC attach failed on pin %d (%s)\n", pins[j], motors[i]->name);
+            }
         }
     }
     stopBot();
@@ -408,6 +420,15 @@ void testMove(const char* name, void (*move)()){
     delay(500);
 }
 
+// One wheel at a time, forward then backward, to check wiring and direction.
+void testMotor(Motor& m){
+    Serial.printf("-- motor: %s forward\n", m.name);
+    setMotor(m, 180);  delay(800);
+    Serial.printf("-- motor: %s backward\n", m.name);
+    setMotor(m, -180); delay(800);
+    setMotor(m, 0);    delay(400);
+}
+
 void testServo(const char* name, Servo& servo){
     Serial.printf("-- servo: %s\n", name);
     servo.write(45);  delay(600);
@@ -439,16 +460,18 @@ void testScrubbers(unsigned long ms){
 void loop(){
     testSensor(3000);
 
+    for (Motor* m : motors) testMotor(*m);
+
     testMove("forward", forward);
     testMove("backward", backward);
     testMove("spin left", spinLeft);
     testMove("spin right", spinRight);
 
-    testServo("broom", broom_serv);
-    testServo("sponge 1", sponge1_serv);
-    testServo("sponge 2", sponge2_serv);
+    // testServo("broom", broom_serv);
+    // testServo("sponge 1", sponge1_serv);
+    // testServo("sponge 2", sponge2_serv);
 
-    testScrubbers(4000);
+    // testScrubbers(4000);
 
     Serial.println("== cycle done ==");
     delay(2000);
